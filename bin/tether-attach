@@ -1,0 +1,142 @@
+#!/bin/sh
+# tether-attach: server side of claude-tether.
+# Attaches to a persistent Claude Code session, or starts one. dtach only keeps
+# the process alive and passes its output straight through, so the local
+# terminal keeps native scrollback, selection and copy/paste.
+#
+# Usage: tether-attach [-d DIR] [NAME]
+#   NAME  session name (default: "default"); one dtach socket per name
+#   -d    working directory for a new session (default: the session's last
+#         directory, else $TETHER_DIR, else $HOME); ignored while it is running
+#
+# Detach: Ctrl-\   Reattach: run it again.
+#
+# Environment (all optional):
+#   TETHER_STATE_DIR      sockets and state (default ~/.local/state/claude-tether)
+#   TETHER_DIR            default working directory
+#   TETHER_RESTORE_MODES  1 (default) or 0: on reattach, re-enable the terminal
+#                         modes Claude sets only at startup
+#   TETHER_RUN            path to tether-run (default: next to this script)
+#   NO_COLOR              disable colors
+set -u
+
+usage() { echo "usage: tether-attach [-d DIR] [NAME]" >&2; exit 2; }
+dir=""
+while getopts d:h opt; do
+  case $opt in d) dir=$OPTARG ;; *) usage ;; esac
+done
+shift $((OPTIND - 1))
+name=${1:-default}
+case $name in "" | *[!A-Za-z0-9._-]*) echo "tether: invalid session name: $name" >&2; exit 2 ;; esac
+
+base=${TETHER_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/claude-tether}
+mkdir -p "$base" && chmod 700 "$base"
+sock=$base/$name.sock
+state=$base/$name.session
+dirfile=$base/$name.dir
+cfg=${CLAUDE_CONFIG_DIR:-$HOME/.claude}
+run=${TETHER_RUN:-$(cd "$(dirname "$0")" && pwd)/tether-run}
+
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+  c_acc=$(printf '\033[36m') c_dim=$(printf '\033[2m') c_off=$(printf '\033[0m')
+else
+  c_acc='' c_dim='' c_off=''
+fi
+step() { printf '%s▸%s %s\n' "$c_acc" "$c_off" "$*"; }
+info() { printf '  %s%s%s\n' "$c_dim" "$*" "$c_off"; }
+
+command -v dtach >/dev/null 2>&1 || {
+  echo "tether: dtach is not installed on $(hostname) (apt/dnf/brew install dtach)" >&2
+  exit 1
+}
+
+# the dtach master for this socket, if one is running
+find_master() { pgrep -o -f "^dtach -A $sock " 2>/dev/null; }
+
+# the Claude process under the master, and the conversation it is in
+# (Claude keeps $cfg/sessions/<pid>.json up to date with its sessionId)
+session_of() {
+  for p in $(pgrep -P "$1") $(for c in $(pgrep -P "$1"); do pgrep -P "$c"; done); do
+    f=$cfg/sessions/$p.json
+    [ -f "$f" ] || continue
+    sed -n 's/.*"sessionId": *"\([^"]*\)".*/\1/p' "$f"
+    return
+  done
+}
+
+# age, prompt count and last prompt of the conversation a new session resumes
+summary() {
+  proj=$cfg/projects/$(cd "$1" && pwd -P | sed 's/[^A-Za-z0-9]/-/g')   # physical path, like Claude
+  id=$(cat "$state" 2>/dev/null)
+  f=$proj/$id.jsonl
+  if [ -z "$id" ] || [ ! -f "$f" ]; then info "new conversation"; return; fi
+  info "resuming the conversation this session was last in"
+  command -v python3 >/dev/null 2>&1 || return 0   # details are optional
+  python3 - "$f" "$c_dim" "$c_off" <<'PY' 2>/dev/null
+import json, os, sys, time
+path, dim, off = sys.argv[1:4]
+last, n = None, 0
+for line in open(path, encoding="utf-8", errors="replace"):
+    try:
+        d = json.loads(line)
+    except ValueError:
+        continue
+    if d.get("type") != "user":
+        continue
+    c = (d.get("message") or {}).get("content")
+    if isinstance(c, list):
+        c = " ".join(x.get("text", "") for x in c if isinstance(x, dict) and x.get("type") == "text")
+    if isinstance(c, str) and c.strip() and not c.lstrip().startswith("<"):
+        last, n = " ".join(c.split()), n + 1
+mins = int(time.time() - os.path.getmtime(path)) // 60
+ago = f"{mins} min ago" if mins < 120 else f"{mins // 60} h ago"
+print(f"  {dim}last active {ago}, {n} prompt{'s' if n != 1 else ''}{off}")
+if last:
+    short = last if len(last) <= 70 else last[:70] + "…"
+    print(f'  {dim}last prompt: "{short}"{off}')
+PY
+}
+
+master=$(find_master)
+if [ -n "$master" ] && [ -S "$sock" ]; then
+  sid=$(session_of "$master")
+  [ -n "$sid" ] && printf %s "$sid" >"$state"   # a restart resumes exactly this one
+  since=$(ps -o lstart= -p "$master" 2>/dev/null | awk '{print $4}')
+  step "Reattaching to Claude session '$name' ${c_dim}(up since ${since:-?})$c_off"
+  others=$(($(pgrep -f "^dtach -A $sock " | wc -l) - 1))   # minus the master
+  [ "$others" -gt 0 ] && info "also attached in $others other window(s)"
+  [ -n "$dir" ] && info "-d ignored: the session is already running in $(cat "$dirfile" 2>/dev/null)"
+  if [ "${TETHER_RESTORE_MODES:-1}" = 1 ] && [ -t 1 ]; then
+    # Claude enables these only at startup; this terminal may be new, or may
+    # have been reset after a dropped link: focus events, color-scheme
+    # reports, kitty keyboard flags 5, modifyOtherKeys 2. Terminals that
+    # don't support one ignore it.
+    printf '\033[?1004h\033[?2031h\033[>5u\033[>4;2m'
+  fi
+else
+  rm -f "$sock"
+  [ -z "$dir" ] && [ -f "$dirfile" ] && dir=$(cat "$dirfile")
+  dir=${dir:-${TETHER_DIR:-$HOME}}
+  # shellcheck disable=SC2088  # matching a literal "~" sent by the client
+  case $dir in "~") dir=$HOME ;; "~/"*) dir=$HOME/${dir#"~/"} ;; /*) ;; *) dir=$HOME/$dir ;; esac
+  [ -d "$dir" ] || { echo "tether: no such directory on $(hostname): $dir" >&2; exit 1; }
+  printf %s "$dir" >"$dirfile"
+  step "Starting Claude session '$name' in ${dir#"$HOME"/}"
+  summary "$dir"
+  info "loading…"
+fi
+info "detach: Ctrl-\\"
+
+# -r ctrl_l: redraw with Ctrl-L. The default (winch) sends a resize, which
+# Claude ignores when the size is unchanged, leaving a blank screen.
+# A login shell gives tether-run the user's normal PATH.
+# shellcheck disable=SC2016  # $0 and $@ expand in the inner shell
+dtach -A "$sock" -z -r ctrl_l "${SHELL:-/bin/sh}" -lc 'exec "$0" "$@"' "$run" "$(cat "$dirfile")" "$state"
+
+sleep 0.3   # let the master finish exiting if Claude quit
+printf '\r\033[K'
+if [ -n "$(find_master)" ]; then
+  step "Detached. Claude keeps running ${c_dim}(run again to reattach)$c_off"
+else
+  step "Claude exited. ${c_dim}Next time it resumes this conversation.$c_off"
+fi

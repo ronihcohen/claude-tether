@@ -1,0 +1,21 @@
+name: test
+on: [push, pull_request]
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq dtach shellcheck
+      - run: shellcheck -x bin/tether bin/tether-attach bin/tether-run install.sh
+      - run: python3 test/test_server.py
+      - run: python3 test/test_client.py
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: brew install dtach
+      - run: python3 test/test_server.py
+      - name: client under the stock bash 3.2
+        run: TEST_BASH=/bin/bash python3 test/test_client.py

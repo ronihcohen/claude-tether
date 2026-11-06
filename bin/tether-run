@@ -1,0 +1,54 @@
+#!/bin/sh
+# tether-run: runs inside the dtach session started by tether-attach.
+# Starts Claude on the exact conversation this session was last in, and keeps
+# recording which conversation that is (/resume and /clear change it).
+#
+# Usage: tether-run DIR STATEFILE
+# Environment: TETHER_CLAUDE (claude binary), TETHER_CLAUDE_ARGS (extra
+# arguments, e.g. "--permission-mode auto"), CLAUDE_CONFIG_DIR.
+dir=$1
+state=$2
+cfg=${CLAUDE_CONFIG_DIR:-$HOME/.claude}
+claude=${TETHER_CLAUDE:-$(command -v claude || echo "$HOME/.local/bin/claude")}
+cd "$dir" || { echo "tether: cannot cd to $dir"; sleep 3; exit 1; }
+# Claude files conversations under the physical path (symlinks resolved)
+proj=$cfg/projects/$(pwd -P | sed 's/[^A-Za-z0-9]/-/g')
+[ -x "$claude" ] || command -v "$claude" >/dev/null 2>&1 || {
+  echo "tether: claude not found (set TETHER_CLAUDE)"; sleep 3; exit 1
+}
+
+id=$(cat "$state" 2>/dev/null)
+# Resume the conversation this session was last in, else start a fresh one.
+# (Not --continue: that picks the newest conversation in the directory, which
+# may belong to another session or another Claude.)
+if [ -n "$id" ] && [ -f "$proj/$id.jsonl" ]; then
+  set -- --resume "$id"
+else
+  set --
+fi
+
+# record the live conversation id; Claude keeps $cfg/sessions/<pid>.json current
+(
+  n=0
+  while kill -0 $$ 2>/dev/null; do
+    for p in $(pgrep -P $$); do
+      f=$cfg/sessions/$p.json
+      [ -f "$f" ] || continue
+      sid=$(sed -n 's/.*"sessionId": *"\([^"]*\)".*/\1/p' "$f")
+      [ -n "$sid" ] && [ "$sid" != "$(cat "$state" 2>/dev/null)" ] && printf %s "$sid" >"$state"
+    done
+    n=$((n + 1))
+    if [ $n -lt 15 ]; then sleep 1; else sleep 5; fi   # quick at first
+  done
+) </dev/null >/dev/null 2>&1 &
+
+start=$(date +%s)
+# shellcheck disable=SC2086  # TETHER_CLAUDE_ARGS is split on purpose
+"$claude" $TETHER_CLAUDE_ARGS "$@"
+rc=$?
+# a resume that fails at once (conversation gone or empty): start fresh
+if [ $rc -ne 0 ] && [ $# -gt 0 ] && [ $(($(date +%s) - start)) -lt 10 ]; then
+  printf '\r\033[K\033[33m!\033[0m Could not resume (%s), starting a fresh conversation\n' "$*"
+  # shellcheck disable=SC2086
+  "$claude" $TETHER_CLAUDE_ARGS
+fi

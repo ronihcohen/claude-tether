@@ -1,0 +1,184 @@
+#!/usr/bin/env bash
+# tether: connect to a persistent Claude Code session on another machine.
+#
+# Plain ssh carries the terminal and dtach on the server keeps Claude alive,
+# so scrollback, selection and copy/paste stay native, the way they are over
+# plain ssh. A dropped connection is retried automatically.
+#
+# Usage: tether [-s NAME] [-d DIR] [HOST]
+#   HOST  ssh destination (default: $TETHER_HOST)
+#   -s    session name on the server (default: $TETHER_SESSION or "default")
+#   -d    working directory for a new session (default: $TETHER_DIR on the
+#         server, else the session's last directory, else home)
+#
+# Inside the session: Ctrl-\ detaches (Claude keeps running).
+# While frozen: Enter ~ . drops the connection at once.
+#
+# Config: ~/.config/claude-tether/config (shell syntax), e.g.
+#   TETHER_HOST=myserver
+#   TETHER_TAILSCALE=auto      # auto | off: start Tailscale first if it's installed
+#   TETHER_SSH_OPTS="-p 2222"  # extra ssh options
+#   TETHER_REMOTE=.local/bin/tether-attach   # server command
+# NO_COLOR disables colors.
+
+set -u
+cfg_file=${XDG_CONFIG_HOME:-$HOME/.config}/claude-tether/config
+# shellcheck source=/dev/null
+[ -r "$cfg_file" ] && . "$cfg_file"
+
+usage() {
+  sed -n '8,15p' "$0" | sed 's/^# \{0,1\}//' >&2
+  exit 2
+}
+session=${TETHER_SESSION:-default}
+dir=""
+while getopts s:d:h opt; do
+  case $opt in s) session=$OPTARG ;; d) dir=$OPTARG ;; *) usage ;; esac
+done
+shift $((OPTIND - 1))
+host=${1:-${TETHER_HOST:-}}
+[ -n "$host" ] || { echo "tether: no host (tether HOST, or TETHER_HOST in $cfg_file)" >&2; exit 2; }
+remote=${TETHER_REMOTE:-.local/bin/tether-attach}
+
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+  c_ok=$'\e[32m' c_bad=$'\e[31m' c_acc=$'\e[36m' c_dim=$'\e[2m' c_off=$'\e[0m'
+else
+  c_ok='' c_bad='' c_acc='' c_dim='' c_off=''
+fi
+# shellcheck disable=SC2206  # options are split on purpose
+ssh_opts=(-o ConnectTimeout=8 -o ServerAliveInterval=2 -o ServerAliveCountMax=4 ${TETHER_SSH_OPTS:-})
+
+now() { perl -MTime::HiRes=time -e 'printf "%.2f", time' 2>/dev/null || date +%s; }
+title() { [ -t 1 ] && printf '\e]0;%s\a' "$1"; }
+
+# step LABEL CMD...: a spinner on one line, then "✓ LABEL (time)" or "✗ LABEL"
+step() {
+  local label=$1 t0 pid rc i=0
+  local frames=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)
+  shift
+  t0=$(now)
+  "$@" >/dev/null 2>"$errf" &
+  pid=$!
+  if [ -t 1 ]; then
+    printf '\e[?25l'
+    while kill -0 "$pid" 2>/dev/null; do
+      printf '\r\e[K%s%s%s %s' "$c_acc" "${frames[i++ % 10]}" "$c_off" "$label"
+      sleep 0.08
+    done
+    printf '\e[?25h'
+  fi
+  wait "$pid"
+  rc=$?
+  if [ $rc -eq 0 ]; then
+    printf '\r\e[K%s✓%s %s %s(%ss)%s\n' "$c_ok" "$c_off" "$label" "$c_dim" \
+      "$(awk -v a="$t0" -v b="$(now)" 'BEGIN { printf "%.1f", b - a }')" "$c_off"
+  else
+    printf '\r\e[K%s✗%s %s\n' "$c_bad" "$c_off" "$label"
+  fi
+  return $rc
+}
+
+# Undo the terminal modes Claude enabled (it can't when the link dies):
+# kitty keyboard stack, modifyOtherKeys, focus/paste/color-scheme reports,
+# synchronized output, mouse tracking; show the cursor; sane tty.
+reset_term() {
+  [ -t 1 ] || return 0
+  printf '\e[<99u\e[>4;0m\e[?1004l\e[?2004l\e[?2031l\e[?2026l\e[?1000l\e[?1002l\e[?1003l\e[?1006l\e[?25h\e[0m'
+  stty sane 2>/dev/null
+}
+
+# is this machine online at all?
+online() {
+  case $(uname) in
+    Darwin) scutil --nwi 2>/dev/null | grep -q '(Reachable)' ;;
+    Linux) ip route get 1.1.1.1 >/dev/null 2>&1 || ip -6 route get 2606:4700::1111 >/dev/null 2>&1 ;;
+    *) return 0 ;;
+  esac
+}
+
+tailscale_bin() {
+  command -v tailscale 2>/dev/null && return
+  local app=/Applications/Tailscale.app/Contents/MacOS/Tailscale
+  [ -x "$app" ] && echo "$app"
+}
+tailscale_up() {
+  "$ts" status --json 2>/dev/null | grep -q '"BackendState": *"Running"' && return 0
+  "$ts" up
+}
+
+# probe: can we reach the host and log in without a prompt?
+probe() { ssh "${ssh_opts[@]}" -o BatchMode=yes "$host" true; }
+
+errf=$(mktemp "${TMPDIR:-/tmp}/tether.XXXXXX")
+trap 'rm -f "$errf"' EXIT
+trap 'reset_term; title ""; echo; exit 130' INT TERM
+
+# remote command with each argument quoted for the remote shell
+rcmd=$remote
+# a path under the local home (e.g. a ~ the local shell expanded) means the
+# remote home: send it as ~/..., which tether-attach maps to its own $HOME
+# shellcheck disable=SC2088  # a literal ~ on purpose: the server expands it
+case $dir in "$HOME") dir="~" ;; "$HOME"/*) dir="~/${dir#"$HOME"/}" ;; esac
+[ -n "$dir" ] && rcmd+=" -d $(printf %q "$dir")"
+rcmd+=" $(printf %q "$session")"
+
+attempt=0 fast_fails=0
+while true; do
+  title "tether · connecting…"
+  ts=""
+  [ "${TETHER_TAILSCALE:-auto}" != off ] && ts=$(tailscale_bin)
+  if [ -n "$ts" ] && ! step "Tailscale" tailscale_up; then
+    echo "  ${c_dim}Tailscale didn't start ($(tail -1 "$errf")); trying anyway$c_off"
+  fi
+
+  interactive_auth=0
+  if step "Reach $host" probe; then
+    :
+  elif grep -qiE 'permission denied|passphrase|password|host key verification' "$errf"; then
+    interactive_auth=1   # reachable, but login needs a prompt: let ssh ask
+    echo "  ${c_dim}$(tail -1 "$errf")$c_off"
+  else
+    if ! online; then
+      echo "  ${c_dim}This machine is offline; waiting for the network$c_off"
+    else
+      echo "  ${c_dim}$host is unreachable ($(tail -1 "$errf"))$c_off"
+    fi
+    interactive_auth=-1
+  fi
+
+  if [ $interactive_auth -ge 0 ]; then
+    attempt=0
+    title "tether · $host"
+    echo "  ${c_dim}frozen? a dead link is noticed in ~8s, or press Enter ~ . to drop it$c_off"
+    t0=$(date +%s)
+    # shellcheck disable=SC2029  # rcmd is meant to expand on the client
+    ssh -q -t "${ssh_opts[@]}" "$host" "$rcmd"
+    rc=$?
+    reset_term
+    if [ $rc -ne 255 ]; then   # detached or Claude exited (the server said which)
+      title ""
+      exit $rc
+    fi
+    if [ $(($(date +%s) - t0)) -lt 3 ]; then
+      fast_fails=$((fast_fails + 1))
+      if [ $fast_fails -ge 3 ]; then
+        echo "${c_bad}✗$c_off ssh keeps failing right away; check: ssh $host" >&2
+        title ""
+        exit 1
+      fi
+    else
+      fast_fails=0
+    fi
+    printf '\n%s✗%s Connection lost\n' "$c_bad" "$c_off"
+  fi
+
+  attempt=$((attempt + 1))
+  delay=$((attempt < 5 ? attempt * 2 : 10))
+  title "tether · reconnecting…"
+  for ((n = delay; n > 0; n--)); do
+    printf '\r\e[K%s↻%s Reconnecting in %ds %s(attempt %d · Ctrl-C to stop)%s' \
+      "$c_acc" "$c_off" "$n" "$c_dim" "$attempt" "$c_off"
+    sleep 1
+  done
+  printf '\r\e[K'
+done

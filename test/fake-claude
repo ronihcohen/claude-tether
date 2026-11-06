@@ -1,0 +1,71 @@
+#!/usr/bin/env python3
+"""Stand-in for `claude` in the tests. It mimics the parts tether depends on:
+- keeps $CLAUDE_CONFIG_DIR/sessions/<pid>.json with the current sessionId
+- writes conversations to $CLAUDE_CONFIG_DIR/projects/<cwd-encoded>/<id>.jsonl
+- --resume ID fails if that conversation is missing; --continue fails if the
+  directory has none ("No conversation found to continue")
+- Ctrl-L redraws; keys: n = new conversation (like /clear), q = quit
+- every start is logged to $FAKE_LOG as one line of arguments
+"""
+import json, os, re, sys, termios, tty, uuid, glob
+
+cfg = os.environ.get("CLAUDE_CONFIG_DIR", os.path.expanduser("~/.claude"))
+proj = os.path.join(cfg, "projects", re.sub(r"[^A-Za-z0-9]", "-", os.getcwd()))
+os.makedirs(proj, exist_ok=True)
+os.makedirs(os.path.join(cfg, "sessions"), exist_ok=True)
+args = sys.argv[1:]
+with open(os.environ["FAKE_LOG"], "a") as f:
+    f.write(" ".join(args) + "\n")
+
+def conv(i):
+    return os.path.join(proj, i + ".jsonl")
+
+if "--resume" in args:
+    sid = args[args.index("--resume") + 1]
+    if not os.path.exists(conv(sid)) or os.environ.get("FAKE_FAIL_RESUME"):
+        print("No conversation found with session ID: " + sid)
+        sys.exit(1)
+elif "--continue" in args:
+    found = sorted(glob.glob(os.path.join(proj, "*.jsonl")), key=os.path.getmtime)
+    if not found:
+        print("No conversation found to continue")
+        sys.exit(1)
+    sid = os.path.basename(found[-1])[:-6]
+else:
+    sid = str(uuid.uuid4())
+
+sess = os.path.join(cfg, "sessions", "%d.json" % os.getpid())
+
+def use(i):
+    global sid
+    sid = i
+    with open(conv(i), "a") as f:
+        f.write(json.dumps({"type": "user", "message": {"content": "hello from fake " + i[:8]}}) + "\n")
+    with open(sess, "w") as f:
+        json.dump({"pid": os.getpid(), "sessionId": i}, f)
+
+def out(s):
+    os.write(1, (s + "\r\n").encode())
+
+use(sid)
+fd = 0
+old = termios.tcgetattr(fd)
+tty.setraw(fd)
+os.write(1, b"\x1b[?2004h\x1b[>5u")   # like Claude: paste mode, kitty keyboard
+out("FAKE READY session=%s args=%s" % (sid, " ".join(args) or "-"))
+try:
+    while True:
+        ch = os.read(fd, 1)
+        if not ch or ch == b"q":
+            break
+        if ch == b"\x0c":
+            out("FAKE REDRAW session=%s" % sid)
+        elif ch == b"n":
+            use(str(uuid.uuid4()))
+            out("FAKE NEW session=%s" % sid)
+finally:
+    termios.tcsetattr(fd, termios.TCSADRAIN, old)
+    try:
+        os.remove(sess)
+    except OSError:
+        pass
