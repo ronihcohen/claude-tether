@@ -26,7 +26,7 @@ case ${1:-} in
   server)
     if [ -n "${2:-}" ]; then
       host=$2
-      say "installing the server side on $host…"
+      say "installing the server side on ${host}…"
       # shellcheck disable=SC2029  # $prefix is meant to expand here
       ssh "$host" "mkdir -p ~/.local/bin" &&
         scp -q "$here/bin/tether-attach" "$here/bin/tether-run" "$host:.local/bin/" &&

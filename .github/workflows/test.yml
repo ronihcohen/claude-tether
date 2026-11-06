@@ -10,6 +10,14 @@ jobs:
       - run: shellcheck -x bin/tether bin/tether-attach bin/tether-run install.sh
       - run: python3 test/test_server.py
       - run: python3 test/test_client.py
+      - name: installer
+        run: |
+          export PREFIX="$RUNNER_TEMP/prefix"
+          ./install.sh client && test -x "$PREFIX/bin/tether"
+          ./install.sh server && test -x "$PREFIX/bin/tether-attach" && test -x "$PREFIX/bin/tether-run"
+          out=$(./install.sh server nohost.invalid 2>&1 || true); echo "$out"
+          echo "$out" | grep -q "installing the server side on nohost.invalid"
+          ./install.sh uninstall && test ! -e "$PREFIX/bin/tether"
 
   macos:
     runs-on: macos-latest
@@ -19,3 +27,11 @@ jobs:
       - run: python3 test/test_server.py
       - name: client under the stock bash 3.2
         run: TEST_BASH=/bin/bash python3 test/test_client.py
+      - name: installer
+        run: |
+          export PREFIX="$RUNNER_TEMP/prefix"
+          ./install.sh client && test -x "$PREFIX/bin/tether"
+          ./install.sh server && test -x "$PREFIX/bin/tether-attach" && test -x "$PREFIX/bin/tether-run"
+          out=$(./install.sh server nohost.invalid 2>&1 || true); echo "$out"
+          echo "$out" | grep -q "installing the server side on nohost.invalid"
+          ./install.sh uninstall && test ! -e "$PREFIX/bin/tether"
