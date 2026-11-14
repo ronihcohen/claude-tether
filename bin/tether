@@ -6,11 +6,13 @@
 # plain ssh. A dropped connection is retried automatically.
 #
 # Usage: tether [-s NAME] [-d DIR] [HOST]
+#        tether -l [-n COUNT] [HOST]
 #   HOST  ssh destination (default: $TETHER_HOST)
 #   -s    session name on the server (default: $TETHER_SESSION or "default")
 #   -d    working directory for a new session (default: $TETHER_DIR on the
 #         server, else the session's last directory, else home)
-#
+#   -l    list the server's Claude conversations: id, age, project, title
+#   -n    how many to list (default 20; 0 lists all)
 # Inside the session: Ctrl-\ detaches (Claude keeps running).
 # While frozen: Enter ~ . drops the connection at once.
 #
@@ -27,13 +29,20 @@ cfg_file=${XDG_CONFIG_HOME:-$HOME/.config}/claude-tether/config
 [ -r "$cfg_file" ] && . "$cfg_file"
 
 usage() {
-  sed -n '8,15p' "$0" | sed 's/^# \{0,1\}//' >&2
+  sed -n '8,17p' "$0" | sed 's/^# \{0,1\}//' >&2
   exit 2
 }
 session=${TETHER_SESSION:-default}
-dir=""
-while getopts s:d:h opt; do
-  case $opt in s) session=$OPTARG ;; d) dir=$OPTARG ;; *) usage ;; esac
+dir="" list=0 count=""
+args=()
+for a in "$@"; do   # long spellings
+  case $a in --list) args+=(-l) ;; --help) args+=(-h) ;; *) args+=("$a") ;; esac
+done
+set -- ${args[@]+"${args[@]}"}
+while getopts s:d:ln:h opt; do
+  case $opt in
+    s) session=$OPTARG ;; d) dir=$OPTARG ;; l) list=1 ;; n) count=$OPTARG ;; *) usage ;;
+  esac
 done
 shift $((OPTIND - 1))
 host=${1:-${TETHER_HOST:-}}
@@ -47,6 +56,16 @@ else
 fi
 # shellcheck disable=SC2206  # options are split on purpose
 ssh_opts=(-o ConnectTimeout=8 -o ServerAliveInterval=2 -o ServerAliveCountMax=4 ${TETHER_SSH_OPTS:-})
+
+# -l: one plain ssh call, no reconnect loop (a tty only for the width/colors)
+if [ $list = 1 ]; then
+  rcmd="$remote -l"
+  [ -n "$count" ] && rcmd+=" -n $(printf %q "$count")"
+  tty=-T
+  [ -t 0 ] && [ -t 1 ] && tty=-t
+  # shellcheck disable=SC2029  # rcmd is meant to expand on the client
+  exec ssh -q "$tty" "${ssh_opts[@]}" "$host" "$rcmd"
+fi
 
 now() { perl -MTime::HiRes=time -e 'printf "%.2f", time' 2>/dev/null || date +%s; }
 title() { [ -t 1 ] && printf '\e]0;%s\a' "$1"; }

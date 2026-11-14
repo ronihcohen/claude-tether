@@ -80,6 +80,21 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn(r"REMOTE-RAN: .local/bin/tether-attach -d my\ dir work", r.stdout)
 
+    def test_list_runs_once_without_probe(self):
+        for args in (("-l", "host"), ("--list", "-n", "5", "host")):
+            for f in ("calls", "n"):
+                open(os.path.join(self.tmp, f), "w").close()
+            self.plan("drop")                       # a failure is reported, not retried
+            r = self.run_tether(*args)
+            self.assertEqual(r.returncode, 255)
+            self.assertEqual(len(self.calls()), 1)
+            self.assertNotIn("BatchMode", self.calls()[0])
+        os.remove(os.path.join(self.tmp, "n"))
+        self.plan("ok")
+        r = self.run_tether("--list", "-n", "5", "host")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("REMOTE-RAN: .local/bin/tether-attach -l -n 5", r.stdout)
+
     def test_local_home_path_becomes_remote_home(self):
         self.plan("ok")
         r = self.run_tether("-d", os.path.expanduser("~/src/app"), "host")

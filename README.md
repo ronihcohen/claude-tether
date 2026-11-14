@@ -58,6 +58,17 @@ Requirements:
 tether myserver                  # attach to the 'default' session, or start it
 tether -s api myserver           # another, independent session
 tether -d ~/src/app myserver     # working directory for a new session
+tether -l myserver               # list the server's Claude conversations
+```
+
+`tether -l` (or `--list`) prints the 20 newest conversations on the server,
+one per line: id, age, project and title (the one set with `/rename`, else
+Claude's own, else the last prompt). Conversations a tether session is in
+are tagged `[name]`, plus `●` while it runs. `-n 50` shows more, `-n 0` all.
+
+```
+3f2a9c1e-5b7d-4e8a-9c0f-1a2b3c4d5e6f    9m  src/api       Add a --json flag to the CLI
+8d4e6f2a-1c3b-4a5d-8e7f-0a1b2c3d4e5f   20h  src/app       [default ●] Fix the flaky upload test
 ```
 
 - **Ctrl-\\** detaches, and Claude keeps running. Run `tether` again to come back.

@@ -2,7 +2,7 @@
 """Server-side tests: drive tether-attach in a pseudo-terminal against
 test/fake-claude, with private state, config and working directories.
 Needs dtach and python3. Run: python3 test/test_server.py"""
-import fcntl, os, pty, re, select, shutil, signal, struct, subprocess, sys, tempfile, termios, time, unittest
+import fcntl, json, os, pty, re, select, shutil, signal, struct, subprocess, sys, tempfile, termios, time, unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ATTACH = os.path.join(ROOT, "bin", "tether-attach")
@@ -194,6 +194,41 @@ class ServerTests(unittest.TestCase):
         self.assertNotEqual(sa, sb)
         b.detach()
         self.assertTrue(self.master_alive("default") and self.master_alive("other"))
+
+    def test_list_conversations(self):
+        cwd = os.path.realpath(self.work)
+        proj = os.path.join(self.tmp, "claude", "projects", re.sub(r"[^A-Za-z0-9]", "-", cwd))
+        os.makedirs(proj)
+        def convo(cid, mtime, *records):
+            p = os.path.join(proj, cid + ".jsonl")
+            with open(p, "w") as f:
+                for r in records:
+                    f.write(json.dumps(dict(r, cwd=cwd, sessionId=cid)) + "\n")
+            os.utime(p, (mtime, mtime))
+        now = time.time()
+        user = lambda text: {"type": "user", "message": {"role": "user", "content": text}}
+        convo("aaaa", now - 60, user("first prompt"), {"type": "ai-title", "aiTitle": "Old title"},
+              {"type": "ai-title", "aiTitle": "Claude's title"})
+        convo("bbbb", now - 7200, user("x"), {"type": "ai-title", "aiTitle": "ignored"},
+              {"type": "custom-title", "customTitle": "Renamed"})
+        convo("cccc", now - 3 * 86400, user("<command>skip</command>"), user("only a prompt"))
+        convo("dddd", now, {"type": "file-history-snapshot"})          # no prompts: hidden
+        os.makedirs(self.state)
+        with open(os.path.join(self.state, "work.session"), "w") as f:
+            f.write("bbbb")
+        r = subprocess.run(["sh", ATTACH, "-l"], env=self.env, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        lines = r.stdout.splitlines()
+        self.assertEqual([l.split()[0] for l in lines], ["aaaa", "bbbb", "cccc"])
+        self.assertRegex(lines[0], r"aaaa\s+1m\s+\S+\s+Claude's title$")
+        self.assertRegex(lines[1], r"2h .*\[work\] Renamed$")         # session tag, not running
+        self.assertRegex(lines[2], r"3d .*only a prompt$")
+        self.assertNotIn("\x1b", r.stdout)                          # no colors when piped
+        r = subprocess.run(["sh", ATTACH, "-l", "-n", "1"], env=self.env, capture_output=True, text=True)
+        self.assertEqual(r.stdout.splitlines()[0].split()[0], "aaaa")
+        self.assertIn("newest 1 shown", r.stdout)
+        r = subprocess.run(["sh", ATTACH, "-l", "-n", "x"], env=self.env, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 2)
 
     def test_bad_input(self):
         r = subprocess.run(["sh", ATTACH, "bad/name"], env=self.env, capture_output=True, text=True)

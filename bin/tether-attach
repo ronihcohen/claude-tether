@@ -5,9 +5,13 @@
 # terminal keeps native scrollback, selection and copy/paste.
 #
 # Usage: tether-attach [-d DIR] [NAME]
+#        tether-attach -l [-n COUNT]
 #   NAME  session name (default: "default"); one dtach socket per name
 #   -d    working directory for a new session (default: the session's last
 #         directory, else $TETHER_DIR, else $HOME); ignored while it is running
+#   -l    list Claude conversations on this machine, newest first: id, age,
+#         project and title, marking the ones tether sessions are in
+#   -n    how many to list (default 20; 0 lists all)
 #
 # Detach: Ctrl-\   Reattach: run it again.
 #
@@ -20,12 +24,13 @@
 #   NO_COLOR              disable colors
 set -u
 
-usage() { echo "usage: tether-attach [-d DIR] [NAME]" >&2; exit 2; }
-dir=""
-while getopts d:h opt; do
-  case $opt in d) dir=$OPTARG ;; *) usage ;; esac
+usage() { echo "usage: tether-attach [-d DIR] [NAME] | -l [-n COUNT]" >&2; exit 2; }
+dir="" list=0 count=20
+while getopts d:ln:h opt; do
+  case $opt in d) dir=$OPTARG ;; l) list=1 ;; n) count=$OPTARG ;; *) usage ;; esac
 done
 shift $((OPTIND - 1))
+case $count in "" | *[!0-9]*) echo "tether: -n wants a number: $count" >&2; exit 2 ;; esac
 name=${1:-default}
 case $name in "" | *[!A-Za-z0-9._-]*) echo "tether: invalid session name: $name" >&2; exit 2 ;; esac
 
@@ -36,6 +41,124 @@ state=$base/$name.session
 dirfile=$base/$name.dir
 cfg=${CLAUDE_CONFIG_DIR:-$HOME/.claude}
 run=${TETHER_RUN:-$(cd "$(dirname "$0")" && pwd)/tether-run}
+
+# the dtach master for a socket (default: this session's), if one is running
+find_master() { pgrep -o -f "^dtach -A ${1:-$sock} " 2>/dev/null; }
+
+# -l: Claude's conversations, newest first. The title is the one set with
+# /rename, else Claude's own, else the last prompt.
+if [ $list = 1 ]; then
+  command -v python3 >/dev/null 2>&1 || { echo "tether: -l needs python3 on $(hostname)" >&2; exit 1; }
+  # "name id running" for each tether session that has a conversation
+  tags=$(for s in "$base"/*.session; do
+    [ -f "$s" ] || continue
+    n=$(basename "$s" .session) id=$(cat "$s" 2>/dev/null)
+    [ -n "$id" ] || continue
+    up=0; [ -n "$(find_master "$base/$n.sock")" ] && up=1
+    echo "$n $id $up"
+  done)
+  NO_COLOR=${NO_COLOR:-$([ -t 1 ] || echo 1)} \
+    exec python3 - "$cfg/projects" "$count" "$HOME" "$tags" <<'PY'
+import glob, json, os, re, shutil, sys, time
+root, count, home, tags = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
+color = not os.environ.get("NO_COLOR")
+dim, acc, ok, off = ("\033[2m", "\033[36m", "\033[32m", "\033[0m") if color else ("",) * 4
+marks = {}
+for line in tags.splitlines():
+    n, cid, up = line.split()
+    marks.setdefault(cid, []).append((n, up == "1"))
+
+def describe(path):
+    """(title, working directory), or None if it has no prompts"""
+    custom = ai = last = first = cwd = None
+    folder = os.path.basename(os.path.dirname(path))
+    with open(path, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            # the cwd Claude filed the conversation under (it can cd later)
+            if cwd is None and '"cwd"' in line:
+                for m in re.finditer(r'"cwd": ?"((?:[^"\\]|\\.)*)"', line):
+                    try:
+                        c = json.loads('"' + m.group(1) + '"')
+                    except ValueError:
+                        continue
+                    if re.sub(r"[^A-Za-z0-9]", "-", c) == folder:
+                        cwd = c
+                        break
+            # most lines are tool output: only parse the few that can matter
+            if '"custom-title"' in line or '"ai-title"' in line or '"last-prompt"' in line:
+                try:
+                    d = json.loads(line)
+                except ValueError:
+                    continue
+                t = d.get("type")
+                if t == "custom-title":
+                    custom = d.get("customTitle") or custom
+                elif t == "ai-title":
+                    ai = d.get("aiTitle") or ai
+                elif t == "last-prompt":
+                    last = d.get("lastPrompt") or last
+            elif first is None and '"user"' in line:
+                try:
+                    d = json.loads(line)
+                except ValueError:
+                    continue
+                if d.get("type") != "user":
+                    continue
+                c = (d.get("message") or {}).get("content")
+                if isinstance(c, list):
+                    c = " ".join(x.get("text", "") for x in c if isinstance(x, dict) and x.get("type") == "text")
+                if isinstance(c, str) and c.strip() and not c.lstrip().startswith("<"):
+                    first = c
+    t = custom or ai or last or first
+    return (" ".join(t.split()), cwd) if t else None
+
+def project(path, cwd):
+    """the working directory, ~-relative; else Claude's dashed folder name"""
+    if cwd:
+        if cwd == home:
+            return "~"
+        return cwd[len(home) + 1:] if cwd.startswith(home + "/") else cwd
+    return os.path.basename(os.path.dirname(path)).lstrip("-")
+
+def ago(t):
+    s = time.time() - t
+    for unit, n in (("d", 86400), ("h", 3600), ("m", 60)):
+        if s >= n:
+            return f"{int(s // n)}{unit}"
+    return "now"
+
+files = [f for f in glob.glob(os.path.join(glob.escape(root), "*", "*.jsonl"))
+         if "observer-sessions" not in f]   # claude-mem's background sessions
+files.sort(key=os.path.getmtime, reverse=True)
+rows, more = [], False
+for i, f in enumerate(files):
+    d = describe(f)
+    if d is None:
+        continue
+    rows.append((os.path.basename(f)[:-6], ago(os.path.getmtime(f)), project(f, d[1]), d[0]))
+    if count and len(rows) >= count:
+        more = i + 1 < len(files)
+        break
+if not rows:
+    print("no Claude conversations found in " + root)
+    sys.exit(0)
+
+width = shutil.get_terminal_size((120, 24)).columns
+pw = min(18, max(len(r[2]) for r in rows))
+for cid, age, proj, title in rows:
+    tag = ""
+    for n, up in marks.get(cid, []):
+        tag += f"[{n}{' ●' if up else ''}] "
+    proj = proj if len(proj) <= pw else proj[:pw - 1] + "…"
+    room = width - (36 + 2 + 4 + 2 + pw + 2) - len(tag) - 1
+    if room > 8 and len(title) > room:
+        title = title[:room - 1] + "…"
+    c = ok if tag else ""
+    print(f"{c}{cid}{off}  {dim}{age:>4}  {proj:<{pw}}{off}  {acc}{tag}{off}{title}")
+if more:
+    print(f"{dim}newest {len(rows)} shown; -n 0 lists all{off}")
+PY
+fi
 
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
   c_acc=$(printf '\033[36m') c_dim=$(printf '\033[2m') c_off=$(printf '\033[0m')
@@ -49,9 +172,6 @@ command -v dtach >/dev/null 2>&1 || {
   echo "tether: dtach is not installed on $(hostname) (apt/dnf/brew install dtach)" >&2
   exit 1
 }
-
-# the dtach master for this socket, if one is running
-find_master() { pgrep -o -f "^dtach -A $sock " 2>/dev/null; }
 
 # the Claude process under the master, and the conversation it is in
 # (Claude keeps $cfg/sessions/<pid>.json up to date with its sessionId)
