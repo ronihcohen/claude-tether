@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Stand-in for `claude` in the tests. It mimics the parts tether depends on:
 - keeps $CLAUDE_CONFIG_DIR/sessions/<pid>.json with the current sessionId
-- writes conversations to $CLAUDE_CONFIG_DIR/projects/<cwd-encoded>/<id>.jsonl
+- writes conversations to $CLAUDE_CONFIG_DIR/projects/<cwd-encoded>/<id>.jsonl,
+  each record carrying its cwd
 - --resume ID fails if that conversation is missing; --continue fails if the
   directory has none ("No conversation found to continue")
 - Ctrl-L redraws; keys: n = new conversation (like /clear), q = quit
@@ -40,7 +41,8 @@ def use(i):
     global sid
     sid = i
     with open(conv(i), "a") as f:
-        f.write(json.dumps({"type": "user", "message": {"content": "hello from fake " + i[:8]}}) + "\n")
+        f.write(json.dumps({"type": "user", "cwd": os.getcwd(), "sessionId": i,
+                            "message": {"content": "hello from fake " + i[:8]}}) + "\n")
     with open(sess, "w") as f:
         json.dump({"pid": os.getpid(), "sessionId": i}, f)
 

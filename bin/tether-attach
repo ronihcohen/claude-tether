@@ -5,10 +5,14 @@
 # terminal keeps native scrollback, selection and copy/paste.
 #
 # Usage: tether-attach [-d DIR] [NAME]
+#        tether-attach -r ID [NAME]
 #        tether-attach -l [-n COUNT]
 #   NAME  session name (default: "default"); one dtach socket per name
 #   -d    working directory for a new session (default: the session's last
 #         directory, else $TETHER_DIR, else $HOME); ignored while it is running
+#   -r    resume conversation ID: reattach to the tether session already in
+#         it, else start session NAME (default: the ID's first 8 characters)
+#         on it, in the conversation's own directory
 #   -l    list Claude conversations on this machine, newest first: id, age,
 #         project and title, marking the ones tether sessions are in
 #   -n    how many to list (default 20; 0 lists all)
@@ -24,26 +28,66 @@
 #   NO_COLOR              disable colors
 set -u
 
-usage() { echo "usage: tether-attach [-d DIR] [NAME] | -l [-n COUNT]" >&2; exit 2; }
-dir="" list=0 count=20
-while getopts d:ln:h opt; do
-  case $opt in d) dir=$OPTARG ;; l) list=1 ;; n) count=$OPTARG ;; *) usage ;; esac
+usage() { echo "usage: tether-attach [-d DIR] [NAME] | -r ID [NAME] | -l [-n COUNT]" >&2; exit 2; }
+die() { echo "tether: $*" >&2; exit 1; }
+dir="" list=0 count=20 resume=""
+while getopts d:ln:r:h opt; do
+  case $opt in d) dir=$OPTARG ;; l) list=1 ;; n) count=$OPTARG ;; r) resume=$OPTARG ;; *) usage ;; esac
 done
 shift $((OPTIND - 1))
 case $count in "" | *[!0-9]*) echo "tether: -n wants a number: $count" >&2; exit 2 ;; esac
-name=${1:-default}
-case $name in "" | *[!A-Za-z0-9._-]*) echo "tether: invalid session name: $name" >&2; exit 2 ;; esac
 
 base=${TETHER_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/claude-tether}
 mkdir -p "$base" && chmod 700 "$base"
-sock=$base/$name.sock
-state=$base/$name.session
-dirfile=$base/$name.dir
 cfg=${CLAUDE_CONFIG_DIR:-$HOME/.claude}
 run=${TETHER_RUN:-$(cd "$(dirname "$0")" && pwd)/tether-run}
 
 # the dtach master for a socket (default: this session's), if one is running
 find_master() { pgrep -o -f "^dtach -A ${1:-$sock} " 2>/dev/null; }
+
+# -r: pick the session for conversation $resume, and point it there
+if [ -n "$resume" ]; then
+  case $resume in *[!A-Za-z0-9-]*) echo "tether: invalid conversation id: $resume" >&2; exit 2 ;; esac
+  conv=""
+  for f in "$cfg"/projects/*/"$resume".jsonl; do [ -f "$f" ] && conv=$f && break; done
+  [ -n "$conv" ] || die "no conversation $resume on $(hostname) (tether -l lists them)"
+  in=""   # a running session already in it
+  for s in "$base"/*.session; do
+    [ -f "$s" ] || continue
+    n=$(basename "$s" .session)
+    [ "$(cat "$s" 2>/dev/null)" = "$resume" ] && [ -n "$(find_master "$base/$n.sock")" ] && in=$n && break
+  done
+  if [ -n "$in" ]; then
+    set -- "$in"
+  else
+    name=${1:-$(printf %s "$resume" | cut -c1-8)}
+    [ -z "$(find_master "$base/$name.sock")" ] ||
+      die "session '$name' is running another conversation; quit Claude there first, or pick another name"
+    # the directory Claude filed it under: the cwd whose dashed form is the folder
+    folder=$(basename "$(dirname "$conv")")
+    dir=$(grep -o '"cwd": *"[^"]*"' "$conv" | sed 's/^"cwd": *"//; s/"$//' | sort -u |
+      while IFS= read -r c; do
+        [ "$(printf %s "$c" | sed 's/[^A-Za-z0-9]/-/g')" = "$folder" ] && { printf %s "$c"; break; }
+      done)
+    if [ -z "$dir" ] || [ ! -d "$dir" ]; then die "can't find the directory of conversation $resume"; fi
+    printf %s "$resume" >"$base/$name.session"
+    printf %s "$dir" >"$base/$name.dir"
+    set -- "$name"
+  fi
+  # the same conversation open in another Claude would fork it
+  for f in "$cfg"/sessions/*.json; do
+    if [ -f "$f" ] && grep -q "\"sessionId\": *\"$resume\"" "$f"; then
+      p=$(basename "$f" .json)
+      kill -0 "$p" 2>/dev/null && [ -z "$in" ] && echo "tether: note: conversation $resume is also open in Claude pid $p" >&2
+    fi
+  done
+fi
+
+name=${1:-default}
+case $name in "" | *[!A-Za-z0-9._-]*) echo "tether: invalid session name: $name" >&2; exit 2 ;; esac
+sock=$base/$name.sock
+state=$base/$name.session
+dirfile=$base/$name.dir
 
 # -l: Claude's conversations, newest first. The title is the one set with
 # /rename, else Claude's own, else the last prompt.

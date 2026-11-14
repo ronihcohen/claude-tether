@@ -95,6 +95,13 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("REMOTE-RAN: .local/bin/tether-attach -l -n 5", r.stdout)
 
+    def test_resume_lets_the_server_name_the_session(self):
+        self.plan("ok", "ok")
+        r = self.run_tether("-r", "e555-6952", "host")
+        self.assertIn("REMOTE-RAN: .local/bin/tether-attach -r e555-6952\n", r.stdout)
+        r = self.run_tether("--resume=e555-6952", "-s", "work", "host")
+        self.assertIn("REMOTE-RAN: .local/bin/tether-attach -r e555-6952 work\n", r.stdout)
+
     def test_local_home_path_becomes_remote_home(self):
         self.plan("ok")
         r = self.run_tether("-d", os.path.expanduser("~/src/app"), "host")

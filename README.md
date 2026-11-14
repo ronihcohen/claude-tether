@@ -59,12 +59,19 @@ tether myserver                  # attach to the 'default' session, or start it
 tether -s api myserver           # another, independent session
 tether -d ~/src/app myserver     # working directory for a new session
 tether -l myserver               # list the server's Claude conversations
+tether -r 3f2a9c1e-… myserver    # resume one of them
 ```
 
 `tether -l` (or `--list`) prints the 20 newest conversations on the server,
 one per line: id, age, project and title (the one set with `/rename`, else
 Claude's own, else the last prompt). Conversations a tether session is in
 are tagged `[name]`, plus `●` while it runs. `-n 50` shows more, `-n 0` all.
+
+`tether -r ID` (or `--resume ID`) opens a conversation from that list. If a
+running tether session is already in it, you reattach there; otherwise a new
+session named after the ID's first 8 characters (or `-s NAME`) starts Claude
+on it, in the directory the conversation belongs to. Your other sessions are
+left alone, and `tether -s 3f2a9c1e` comes back to it later.
 
 ```
 3f2a9c1e-5b7d-4e8a-9c0f-1a2b3c4d5e6f    9m  src/api       Add a --json flag to the CLI

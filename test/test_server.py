@@ -75,9 +75,7 @@ class ServerTests(unittest.TestCase):
         self.env.pop("NO_COLOR", None)
 
     def tearDown(self):
-        sock = os.path.join(self.state, "default.sock")
-        subprocess.run(["pkill", "-f", "dtach -A " + sock], check=False)
-        subprocess.run(["pkill", "-f", "dtach -A " + os.path.join(self.state, "other.sock")], check=False)
+        subprocess.run(["pkill", "-f", "dtach -A " + self.state + "/"], check=False)   # every session
         time.sleep(0.3)
         shutil.rmtree(self.tmp, ignore_errors=True)
 
@@ -194,6 +192,47 @@ class ServerTests(unittest.TestCase):
         self.assertNotEqual(sa, sb)
         b.detach()
         self.assertTrue(self.master_alive("default") and self.master_alive("other"))
+
+    def test_resume_by_id(self):
+        s, sid = self.start()                             # a conversation in self.work
+        self.wait_recorded(sid)
+        s.send(b"q")
+        s.finish()
+        r = Session(self.env, "-r", sid)
+        self.assertTrue(r.read_until(r"FAKE READY"), plain(r.raw))
+        self.assertIn("Starting Claude session '%s'" % sid[:8], plain(r.raw))
+        self.assertEqual(self.starts()[-1], "--resume " + sid)
+        r.detach()
+        self.assertTrue(self.master_alive(sid[:8]))
+        again = Session(self.env, "-r", sid)               # running: reattach, no new Claude
+        self.assertTrue(again.read_until(r"FAKE REDRAW"), plain(again.raw))
+        self.assertIn("Reattaching to Claude session '%s'" % sid[:8], plain(again.raw))
+        again.detach()
+        self.assertEqual(len(self.starts()), 2)
+        r = subprocess.run(["sh", ATTACH, "-r", "nope-0000"], env=self.env, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("no conversation nope-0000", r.stderr)
+
+    def test_resume_finds_the_session_already_in_it(self):
+        s, sid = self.start()
+        self.wait_recorded(sid)
+        s.detach()
+        r = Session(self.env, "-r", sid)
+        self.assertTrue(r.read_until(r"FAKE REDRAW"), plain(r.raw))
+        self.assertIn("Reattaching to Claude session 'default'", plain(r.raw))
+        r.detach()
+        self.assertEqual(len(self.starts()), 1)
+
+    def test_resume_wont_take_over_a_busy_session(self):
+        a, first = self.start()
+        self.wait_recorded(first)
+        a.send(b"q")
+        a.finish()
+        b, _ = self.start("other")                        # 'other' is on another conversation
+        b.detach()
+        r = subprocess.run(["sh", ATTACH, "-r", first, "other"], env=self.env, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("running another conversation", r.stderr)
 
     def test_list_conversations(self):
         cwd = os.path.realpath(self.work)

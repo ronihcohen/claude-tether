@@ -6,11 +6,14 @@
 # plain ssh. A dropped connection is retried automatically.
 #
 # Usage: tether [-s NAME] [-d DIR] [HOST]
+#        tether -r ID [-s NAME] [HOST]
 #        tether -l [-n COUNT] [HOST]
 #   HOST  ssh destination (default: $TETHER_HOST)
 #   -s    session name on the server (default: $TETHER_SESSION or "default")
 #   -d    working directory for a new session (default: $TETHER_DIR on the
 #         server, else the session's last directory, else home)
+#   -r    resume conversation ID in its own session (named after the ID,
+#         or NAME), or reattach to the session already in it
 #   -l    list the server's Claude conversations: id, age, project, title
 #   -n    how many to list (default 20; 0 lists all)
 # Inside the session: Ctrl-\ detaches (Claude keeps running).
@@ -29,19 +32,23 @@ cfg_file=${XDG_CONFIG_HOME:-$HOME/.config}/claude-tether/config
 [ -r "$cfg_file" ] && . "$cfg_file"
 
 usage() {
-  sed -n '8,17p' "$0" | sed 's/^# \{0,1\}//' >&2
+  sed -n '8,20p' "$0" | sed 's/^# \{0,1\}//' >&2
   exit 2
 }
 session=${TETHER_SESSION:-default}
-dir="" list=0 count=""
+dir="" list=0 count="" resume="" named=0
 args=()
 for a in "$@"; do   # long spellings
-  case $a in --list) args+=(-l) ;; --help) args+=(-h) ;; *) args+=("$a") ;; esac
+  case $a in
+    --list) args+=(-l) ;; --resume) args+=(-r) ;; --resume=*) args+=(-r "${a#--resume=}") ;;
+    --help) args+=(-h) ;; *) args+=("$a") ;;
+  esac
 done
 set -- ${args[@]+"${args[@]}"}
-while getopts s:d:ln:h opt; do
+while getopts s:d:ln:r:h opt; do
   case $opt in
-    s) session=$OPTARG ;; d) dir=$OPTARG ;; l) list=1 ;; n) count=$OPTARG ;; *) usage ;;
+    s) session=$OPTARG named=1 ;; d) dir=$OPTARG ;; l) list=1 ;; n) count=$OPTARG ;;
+    r) resume=$OPTARG ;; *) usage ;;
   esac
 done
 shift $((OPTIND - 1))
@@ -139,7 +146,12 @@ rcmd=$remote
 # shellcheck disable=SC2088  # a literal ~ on purpose: the server expands it
 case $dir in "$HOME") dir="~" ;; "$HOME"/*) dir="~/${dir#"$HOME"/}" ;; esac
 [ -n "$dir" ] && rcmd+=" -d $(printf %q "$dir")"
-rcmd+=" $(printf %q "$session")"
+if [ -n "$resume" ]; then
+  rcmd+=" -r $(printf %q "$resume")"
+  [ $named = 1 ] && rcmd+=" $(printf %q "$session")"   # else the server names it
+else
+  rcmd+=" $(printf %q "$session")"
+fi
 
 attempt=0 fast_fails=0
 while true; do
